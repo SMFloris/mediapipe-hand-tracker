@@ -2,6 +2,12 @@
 
 ## Instructions
 
+For windows, in order to install mediapipe:
+
+```
+https://ai.google.dev/edge/mediapipe/framework/getting_started/install#installing_on_windows
+```
+
 ### Recommended to use venv
 
 ```
@@ -12,7 +18,7 @@ source .venv/bin/activate
 ### Install dependencies
 
 ```
-pip install -r requirements
+pip install -r requirements.txt
 ```
 
 ### Download mediapipe model and put it in folder

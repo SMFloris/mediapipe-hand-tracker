@@ -1,8 +1,8 @@
-mediapipe==0.10.21
+mediapipe
 absl-py
 numpy
-attrs>=19.1.0
-flatbuffers>=2.0
+attrs
+flatbuffers
 jax
 jaxlib
 sentencepiece
