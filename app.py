@@ -1,4 +1,7 @@
-#@markdown We implemented some functions to visualize the hand landmark detection results. <br/> Run the following cell to activate the functions.
+"""
+@author: Elena Eremia
+@author: Floris Stoica
+"""
 
 import mediapipe as mp
 from mediapipe import solutions
@@ -13,6 +16,7 @@ import asyncio
 import websockets
 import orjson
 import argparse
+import time
 
 LANDMARKS = [
     "WRIST",
@@ -105,82 +109,178 @@ VisionRunningMode = mp.tasks.vision.RunningMode
 
 # Create a hand landmarker instance with the live stream mode:
 def print_result(result: GestureRecognizerResult, output_image: mp.Image, timestamp_ms: int):
-    # print('hand landmarker result: {}'.format(result))
     global lastResults
     with lock:
         lastResults = result
 
-def recognize_gestures(src, width, height, isRunningInServerMode):
-    if not cv2.cuda.getCudaEnabledDeviceCount():
-        print("CUDA is not available.")
-        use_cuda = False
-    else:
-        use_cuda = True
+
+# Check if CUDA is available
+def check_cuda():
+    if hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0:
         print("CUDA is available.")
+        return True
+    print("CUDA is not available.")
+    return False
 
-    # Use multi-threaded capture
+# Check if OpenCL is available
+def check_opencl():
+    if hasattr(cv2, 'ocl') and cv2.ocl.haveOpenCL():
+        print("OpenCL is available.")
+        return True
+    print("OpenCL is not available.")
+    return False
+
+# Test camera function to verify camera is working before main loop
+def test_camera(src):
+    print(f"Testing camera at index {src} with default settings...")
+    test_cap = cv2.VideoCapture(src)
+    if not test_cap.isOpened():
+        print(f"Error: Could not open camera at index {src}")
+        return False
+    
+    test_ret, test_frame = test_cap.read()
+    test_cap.release()
+    
+    if not test_ret:
+        print("Error: Could not read from camera with default settings")
+        return False
+    else:
+        print("Successfully read a test frame with default settings")
+        return True
+
+# Function to recognize gestures with hardware acceleration when available
+def recognize_gestures(src, width, height, isRunningInServerMode):
+    # Check hardware acceleration availability
+    use_cuda = check_cuda()
+    use_opencl = check_opencl()
+    
+    acceleration_type = None
+    if use_cuda:
+        acceleration_type = "CUDA"
+        print("Using CUDA for hardware acceleration.")
+    elif use_opencl:
+        acceleration_type = "OpenCL"
+        print("Using OpenCL for hardware acceleration.")
+    else:
+        print("Falling back to CPU processing.")
+    
+    # Test the camera first
+    if not test_camera(src):
+        print("Camera test failed. Please check camera connections and permissions.")
+        return
+    
+    # Initialize the camera with requested settings
+    print(f"Attempting to open camera at index {src} with resolution {width}x{height}")
     cap = cv2.VideoCapture(src)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    # Check if the webcam is opened correctly
-    if not cap.isOpened():
-        print("Error: Could not open webcam.")
-        exit()
-
+    
+    # Set camera properties
+    print(f"Setting resolution to {width}x{height}...")
+    width_success = cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    height_success = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    fps_success = cap.set(cv2.CAP_PROP_FPS, 30)
+    
+    # Verify actual camera settings
+    actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Actual camera settings: {actual_width}x{actual_height} @ {actual_fps}fps")
+    
+    # Test reading a frame with custom settings
+    for attempt in range(5):
+        ret, frame = cap.read()
+        if ret:
+            print(f"Successfully read frame on attempt {attempt+1}")
+            break
+        else:
+            print(f"Failed to read frame on attempt {attempt+1}")
+            time.sleep(1)
+    
+    if not ret:
+        print("Error: Could not read frames with custom settings. Exiting.")
+        cap.release()
+        return
+    
+    # Create options for the gesture recognizer
+    model_path = os.path.join(os.path.dirname(__file__), 'gesture_recognizer.task')
+    if not os.path.exists(model_path):
+        print(f"Error: Model file not found at {model_path}")
+        print("Please download the gesture_recognizer.task model from MediaPipe")
+        cap.release()
+        return
+    
     options = GestureRecognizerOptions(
-        base_options=BaseOptions(model_asset_path='./gesture_recognizer.task'),
+        base_options=BaseOptions(model_asset_path=model_path),
         running_mode=VisionRunningMode.LIVE_STREAM,
         num_hands=2,
         result_callback=print_result)
-    with GestureRecognizer.create_from_options(options) as landmarker:
+    
+    # Main processing loop
+    print("Starting main processing loop...")
+    with GestureRecognizer.create_from_options(options) as recognizer:
         while True:
-            ret, frame = cap.read()  # Read the latest frame
+            ret, frame = cap.read()
+            
             if not ret:
-                print("Error: Couldn't read frame.")
+                print("Error: Failed to read frame in main loop")
                 break
-
-            if use_cuda:
-                gpu_image = cv2.cuda_GpuMat()
-                gpu_image.upload(frame)
-
-                # Flip the image on the GPU
-                gpu_flipped = cv2.cuda.flip(gpu_image, 1)  # Flip horizontally
-
-                # Download back to CPU
-                frame = gpu_flipped.download()
-            else:
-                frame = cv2.flip(frame, 1)
-
-            frame_timestamp_ms = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000) 
-            if use_cuda:
-                # Upload frame to GPU
+            
+            # Process the frame with hardware acceleration if available
+            if acceleration_type == "CUDA":
+                # Upload to GPU
                 gpu_frame = cv2.cuda_GpuMat()
                 gpu_frame.upload(frame)
-
-                # Resize on GPU
-                gpu_resized = cv2.cuda.resize(gpu_frame, (640, 480))  # Resize to 640x360
-
-                # Download back to CPU
-                frame_small = gpu_resized.download()
+                
+                # Process with CUDA
+                gpu_flipped = cv2.cuda.flip(gpu_frame, 1)  # Horizontal flip
+                frame = gpu_flipped.download()
+            elif acceleration_type == "OpenCL":
+                # Create UMat from frame
+                ocl_frame = cv2.UMat(frame)
+                # Process with OpenCL
+                ocl_frame = cv2.flip(ocl_frame, 1)  # Horizontal flip
+                frame = ocl_frame.get()
             else:
-                # CPU fallback
-                frame_small = cv2.resize(frame, (640, 480))
+                # CPU processing
+                frame = cv2.flip(frame, 1)
+            
+            # Convert the frame for MediaPipe
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            
 
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-            landmarker.recognize_async(mp_image, frame_timestamp_ms)
-            if lastResults is not None:
-                frame = draw_landmarks_on_image(frame, lastResults)
-
-            if not isRunningInServerMode:
-                cv2.imshow("Webcam Feed", frame)  # Display the frame
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):  # Press 'q' to exit
+            
+            # Process with the gesture recognizer
+            frame_timestamp_ms = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
+            recognizer.recognize_async(mp_image, frame_timestamp_ms)
+            
+            # Resize the frame with hardware acceleration if available
+            if acceleration_type == "CUDA":
+                gpu_frame = cv2.cuda_GpuMat()
+                gpu_frame.upload(frame)
+                gpu_resized = cv2.cuda.resize(gpu_frame, (640, 480))
+                frame = gpu_resized.download()
+            elif acceleration_type == "OpenCL":
+                ocl_frame = cv2.UMat(frame)
+                ocl_frame = cv2.resize(ocl_frame, (640, 480))
+                frame = ocl_frame.get()
+            else:
+                frame = cv2.resize(frame, (640, 480))
+            
+            # Show the annotated image if not in server mode
+            if not isRunningInServerMode and lastResults is not None:
+                with lock:
+                    annotated_image = draw_landmarks_on_image(frame, lastResults)
+                cv2.imshow("Gesture Recognition", annotated_image)
+            elif not isRunningInServerMode:
+                cv2.imshow("Webcam Feed", frame)
+            
+            # Check for exit key
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
-        stream.stop()
+    
+    # Clean up
+    cap.release()
+    if not isRunningInServerMode:
         cv2.destroyAllWindows()
 
 def serialize_results():
@@ -213,7 +313,6 @@ def serialize_results():
 
     return orjson.dumps(resultDict).decode("utf-8")
 
-
 async def websocket_handler(websocket):
     """Handle WebSocket connections."""
     clients.add(websocket)
@@ -222,7 +321,7 @@ async def websocket_handler(websocket):
             await websocket.send(serialize_results())  # Send latest hand landmarks
             await asyncio.sleep(0.01)  # Prevents busy-waiting
     except websockets.exceptions.ConnectionClosed:
-        pass
+        print("Client disconnected")
     finally:
         clients.remove(websocket)
 
@@ -234,11 +333,12 @@ async def start_server(port):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gesture recognition server")
-    parser.add_argument("--server", type=bool, default=False ,help="Run in server mode. Will not draw output.")
-    parser.add_argument("--port", type=int, default=8765 ,help="Websocket port. Default is 8765")
+    parser.add_argument("--server", action="store_true", help="Run in server mode. Will not draw output.")
+    parser.add_argument("--port", type=int, default=8765, help="Websocket port. Default is 8765")
     parser.add_argument("--camera", type=int, default=0, help="The id of the webcam - Default is 0 and it grabs the first one")
     parser.add_argument("--resolution-width", type=int, default=1920, help="Width of webcam resolution - in pixels. Default is 1920")
     parser.add_argument("--resolution-height", type=int, default=1080, help="Height of webcam resolution - in pixels. Default is 1080")
+    parser.add_argument("--force-cpu", action="store_true", help="Force CPU processing even if hardware acceleration is available")
     args = parser.parse_args()
 
     # Start video capture in a separate thread
